@@ -1,0 +1,25 @@
+CADENCE FINANCIAL SERVICES - INTERNAL AUDIT REPORT
+MEMORANDUM | STRICTLY CONFIDENTIAL
+DATE: September 28, 2026
+TO: Cadence TPRM & AI Governance Committee
+FROM: Daniel Miller (daniel.miller@cadence-corp.com, Emp ID: EMP-11029)
+SUBJECT: Security Incident Review & PII Containment
+
+During the audit of external vendor sub-processor interfaces, the following contractor and employee credentials were observed in transmission logs:
+
+1. Lead Contractor: Alexander Gomez
+   Email: a.gomez@fintech-partners.io
+   Phone: +1 650-555-9204
+   Passport ID: P88291044
+   Assigned Bank Wire Account: 992014827103
+   Aadhaar (Overseas Specialist): 9012 3456 7890
+
+2. Senior Risk Manager: Dr. Priya Raman
+   Email: priya.raman@cadence-corp.com
+   Phone: +91 98840 12345
+   PAN Card: ABCPR1234K
+   Employee ID: EMP-44021
+
+3. Incident Context:
+   Vendor API submitted customer records without sanitization. Sensitive data included SSN 219-40-5812 and credit card 5425 2334 8901 2345.
+   Recommendation: Immediate implementation of Optiv Automated PII Gateway before LLM ingestion.

@@ -1,0 +1,6 @@
+{"id":"email_basic","text":"Contact: alex.morgan@example.test","expected":[{"value":"alex.morgan@example.test","entity_type":"EMAIL_ADDRESS"}]}
+{"id":"ssn_labeled","text":"SSN: 123-45-6789","expected":[{"value":"123-45-6789","entity_type":"US_SSN"}]}
+{"id":"ordinary_financial_words","text":"The checking balance is reviewed by the underwriting division.","expected":[]}
+{"id":"name_in_context","text":"Borrower: Maya Patel; status: approved.","expected":[{"value":"Maya Patel","entity_type":"PERSON"}]}
+{"id":"ordinary_word_may","text":"The meeting may move to May after the policy review.","expected":[]}
+{"id":"phone_labeled","text":"Mobile: +1 212-555-0194","expected":[{"value":"+1 212-555-0194","entity_type":"PHONE_NUMBER"}]}
