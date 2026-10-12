@@ -68,6 +68,7 @@ class PDFImageProcessor:
         image_records: List[EmbeddedImageRecord] = []
         all_image_entities: List[PIIEntity] = []
         seen_md5: Dict[str, str] = {}  # md5 -> first image_id
+        cache_by_md5: Dict[str, Dict[str, Any]] = {}
         img_counter = 0
 
         for page_idx, page in enumerate(doc, start=1):
@@ -100,34 +101,63 @@ class PDFImageProcessor:
                 image_id = f"pdf_p{page_idx}_img{img_counter}"
                 img_counter += 1
 
-                if not is_duplicate:
+                is_full_page_scan = (width >= 800 and height >= 1000 and len(image_list) == 1)
+
+                if is_duplicate and md5_hash in cache_by_md5:
+                    cached = cache_by_md5[md5_hash]
+                    barcode_results = cached["barcodes"]
+                    exif_results = cached["exif"]
+                    ocr_text = cached["ocr"]
+                    classification = cached["classification"]
+                    combined_text = cached["text"]
+                else:
                     seen_md5[md5_hash] = image_id
 
-                # 1. Barcode / QR Code Scanning
-                barcode_results = cls.scan_barcodes(img_bytes)
+                    # 1. Barcode / QR Code Scanning (skip if tiny icon or full-page scanned background)
+                    if width >= 32 and height >= 32 and not is_full_page_scan:
+                        barcode_results = cls.scan_barcodes(img_bytes)
+                    else:
+                        barcode_results = []
 
-                # 2. EXIF Metadata Inspection
-                exif_results = cls.scan_exif(img_bytes)
+                    # 2. EXIF Metadata Inspection
+                    exif_results = cls.scan_exif(img_bytes)
 
-                # 3. Optical Character Recognition (OCR)
-                ocr_text = cls.run_ocr_if_available(img_bytes, page=page, rect=rects[0] if rects else None)
+                    # 3. Optical Character Recognition (OCR)
+                    # Skip full-page scan backgrounds: page-level OCR in pdf_extractor handles them natively
+                    if is_full_page_scan:
+                        ocr_text = ""
+                    elif width >= 32 and height >= 32:
+                        ocr_text = cls.run_ocr_if_available(img_bytes, page=page, rect=rects[0] if rects else None)
+                    else:
+                        ocr_text = ""
 
-                # 4. Aggregate extracted textual content
-                extracted_lines = []
-                for bc in barcode_results:
-                    extracted_lines.append(f"Barcode/QR [{bc.get('type', 'CODE')}]: {bc.get('data', '')}")
-                if ocr_text:
-                    extracted_lines.append(f"OCR Extracted: {ocr_text}")
-                for k, v in exif_results.items():
-                    if any(term in k.lower() for term in ["artist", "author", "user", "comment", "title", "description", "serial"]):
-                        extracted_lines.append(f"EXIF {k}: {v}")
+                    # 4. Aggregate extracted textual content
+                    extracted_lines = []
+                    for bc in barcode_results:
+                        extracted_lines.append(f"Barcode/QR [{bc.get('type', 'CODE')}]: {bc.get('data', '')}")
+                    if ocr_text:
+                        extracted_lines.append(f"OCR Extracted: {ocr_text}")
+                    for k, v in exif_results.items():
+                        if any(term in k.lower() for term in ["artist", "author", "user", "comment", "title", "description", "serial"]):
+                            extracted_lines.append(f"EXIF {k}: {v}")
 
-                combined_text = "\n".join(extracted_lines).strip()
+                    combined_text = "\n".join(extracted_lines).strip()
 
-                # 5. Image Classification
-                classification = cls.classify_image(width, height, bool(barcode_results), bool(ocr_text), is_duplicate)
+                    # 5. Image Classification
+                    if is_full_page_scan:
+                        classification = "Scanned Page"
+                    else:
+                        classification = cls.classify_image(width, height, bool(barcode_results), bool(ocr_text), is_duplicate)
 
-                # 6. PII Detection on recovered text
+                    cache_by_md5[md5_hash] = {
+                        "barcodes": barcode_results,
+                        "exif": exif_results,
+                        "ocr": ocr_text,
+                        "classification": classification,
+                        "text": combined_text
+                    }
+
+                # 6. PII Detection on recovered text (lightweight regex pass; full document scan runs later)
                 image_entities: List[PIIEntity] = []
                 if combined_text:
                     image_location = {
@@ -139,7 +169,7 @@ class PDFImageProcessor:
                         "image_format": ext,
                         "classification": classification
                     }
-                    detected = PIIEngine.detect_in_text(combined_text, block_id=image_id, location=image_location)
+                    detected = PIIEngine.detect_in_text(combined_text, block_id=image_id, location=image_location, skip_neural=True)
                     for ent in detected:
                         ent.source = f"{ent.source}+PyMuPDF_Image"
                         image_entities.append(ent)

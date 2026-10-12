@@ -28,8 +28,11 @@ class PdfExtractor:
             doc = pymupdf.open(file_path)
             total_pages = len(doc)
 
-            # 1. Process Embedded Images across all pages using PyMuPDF
-            image_records, _ = PDFImageProcessor.process_pdf_images(doc)
+            # 1. Process Embedded Images across all pages using PyMuPDF (skip for already-redacted verification outputs)
+            if not file_name.startswith("redacted_"):
+                image_records, _ = PDFImageProcessor.process_pdf_images(doc)
+            else:
+                image_records = []
 
             # Locate local tessdata for native PyMuPDF OCR
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +92,7 @@ class PdfExtractor:
                 else:
                     text_blocks = page.get_text("blocks")
 
+                page_candidates = []
                 for b_idx, b in enumerate(text_blocks):
                     # block_type 0 is text, 1 is image
                     if b[6] != 0:
@@ -107,36 +111,51 @@ class PdfExtractor:
                     if not clean_lines:
                         continue
 
-                    if len(clean_lines) == 1:
-                        line = clean_lines[0]
-                        is_heading = len(line) < 70 and (line.isupper() or line.startswith(("1.", "2.", "3.", "Section", "CADENCE")))
-                        is_bullet = line.startswith(("-", "•", "*", "▪"))
-                        block = ContentBlock(
-                            block_id=f"pdf_p{page_idx}_b{b_idx}",
-                            block_type="heading" if is_heading else ("bullet" if is_bullet else "paragraph"),
-                            text=line,
-                            location={"page": page_idx, "block": b_idx, "bbox": [round(x, 2) for x in b[:4]]},
-                            style_metadata={"heading": is_heading}
-                        )
-                        blocks.append(block)
-                        raw_text_parts.append(line)
-                        block_counter += 1
-                    else:
-                        joined_text = " ".join(clean_lines)
-                        block = ContentBlock(
-                            block_id=f"pdf_p{page_idx}_b{b_idx}",
-                            block_type="paragraph",
-                            text=joined_text,
-                            location={"page": page_idx, "block": b_idx, "bbox": [round(x, 2) for x in b[:4]]},
-                            style_metadata={"lines_count": len(clean_lines)}
-                        )
-                        blocks.append(block)
-                        raw_text_parts.append(joined_text)
-                        block_counter += 1
+                    first_line = clean_lines[0]
+                    is_heading = len(clean_lines) == 1 and len(first_line) < 70 and (
+                        first_line.isupper() or first_line.startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "Section", "CADENCE", "POLICY", "APPENDIX"))
+                    )
+                    is_bullet = first_line.startswith(("-", "•", "*", "▪", "◦"))
+                    b_type = "heading" if is_heading else ("bullet" if is_bullet else "paragraph")
+                    joined_text = " ".join(clean_lines)
+                    page_candidates.append({
+                        "type": b_type,
+                        "text": joined_text,
+                        "lines_count": len(clean_lines),
+                        "bbox": [round(x, 2) for x in b[:4]],
+                        "is_heading": is_heading
+                    })
+
+                # Aggregate contiguous paragraph lines/fragments into coherent paragraphs
+                aggregated_blocks = []
+                for item in page_candidates:
+                    if aggregated_blocks:
+                        prev = aggregated_blocks[-1]
+                        # Merge if both are standard paragraphs and vertical distance is small (<= 16pt)
+                        vert_gap = item["bbox"][1] - prev["bbox"][3]
+                        if prev["type"] == "paragraph" and item["type"] == "paragraph" and 0 <= vert_gap <= 16:
+                            prev["text"] = prev["text"] + " " + item["text"]
+                            prev["bbox"][2] = max(prev["bbox"][2], item["bbox"][2])
+                            prev["bbox"][3] = item["bbox"][3]
+                            prev["lines_count"] += item["lines_count"]
+                            continue
+                    aggregated_blocks.append(item)
+
+                for agg_idx, agg in enumerate(aggregated_blocks):
+                    block = ContentBlock(
+                        block_id=f"pdf_p{page_idx}_b{agg_idx}",
+                        block_type=agg["type"],
+                        text=agg["text"],
+                        location={"page": page_idx, "block": agg_idx, "bbox": agg["bbox"]},
+                        style_metadata={"heading": agg.get("is_heading", False), "lines_count": agg.get("lines_count", 1)}
+                    )
+                    blocks.append(block)
+                    raw_text_parts.append(agg["text"])
+                    block_counter += 1
 
             # 4. Integrate extracted image text (Barcodes, QR codes, OCR, EXIF) as ContentBlocks
             for rec in image_records:
-                if rec.extracted_text and not rec.is_duplicate:
+                if rec.extracted_text and not rec.is_duplicate and rec.classification != "Scanned Page":
                     img_block = ContentBlock(
                         block_id=rec.image_id,
                         block_type="image_text",

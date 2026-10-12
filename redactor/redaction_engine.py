@@ -318,10 +318,16 @@ class RedactionEngine:
 
         doc = pymupdf.open(input_pdf_path)
 
-        # 1. Process and redact sensitive embedded images
+        # 1. Process and redact sensitive embedded images if any image entities were detected
         try:
-            image_records, _ = PDFImageProcessor.process_pdf_images(doc)
-            PDFImageProcessor.redact_pdf_images(doc, image_records, entities)
+            sensitive_xrefs = {
+                ent.location["image_xref"]
+                for ent in entities
+                if ent.location and "image_xref" in ent.location
+            }
+            if sensitive_xrefs:
+                image_records, _ = PDFImageProcessor.process_pdf_images(doc)
+                PDFImageProcessor.redact_pdf_images(doc, image_records, entities)
         except Exception:
             pass
 

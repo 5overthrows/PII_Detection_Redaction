@@ -59,22 +59,90 @@ class PIIEngine:
         "optiv", "optiv consulting", "optiv automated pii gateway", "pii gateway", "gateway",
         "automated pii gateway", "aadhaar", "pan", "pan card", "passport", "ssn",
         "license", "driver license", "tprm", "ai governance committee",
-        "vendor api", "security incident review", "recommendation"
+        "vendor api", "security incident review", "recommendation",
+        "beneficiary name", "beneficiary address", "client name", "primary borrower",
+        "q3 high net", "high net worth", "wealth management", "portfolio review",
+        "operational risk", "credit risk", "market risk", "risk management",
+        "driver license", "driver", "location", "floor", "suite", "lake", "contact",
+        "january", "february", "march", "april", "may", "june", "july", "august",
+        "september", "october", "november", "december"
     }
+
+    KNOWN_HEADER_LABELS = {
+        "client name", "tax id / ssn", "account number", "contact email", "phone",
+        "institution", "primary borrower", "underwriter", "beneficiary name",
+        "beneficiary address", "contact", "address", "location", "floor", "suite",
+        "driver license", "driver", "ssn", "pan", "aadhaar", "dob", "date of birth",
+        "full name", "officer", "author", "borrower", "primary contact", "emergency contact",
+        "lead contractor", "senior risk manager", "senior underwriter", "q3 high net",
+        "high net worth", "wealth management", "portfolio review", "table", "lake"
+    }
+
+    @classmethod
+    def should_skip_neural(cls, text: str) -> bool:
+        """Fast pre-screening heuristic to avoid expensive 1.5B model invocations on CPU."""
+        if not text or len(text.strip()) < 4:
+            return True
+        # If text has no uppercase letters, no digits, and no @, it cannot contain PII entities
+        has_upper = any(c.isupper() for c in text)
+        has_digit = any(c.isdigit() for c in text)
+        has_at = "@" in text
+        if not (has_upper or has_digit or has_at):
+            return True
+        words = text.strip().split()
+        if len(words) <= 3 and text.strip().lower() in cls.FALSE_POSITIVE_WHITELIST:
+            return True
+        return False
 
     @classmethod
     def detect_in_document(cls, doc: DocumentContent, skip_neural: bool = False) -> List[PIIEntity]:
         all_entities: List[PIIEntity] = []
 
-        # Analyze block by block to preserve source traceability (page, line, table)
-        for block in doc.blocks:
-            block_entities = cls.detect_in_text(block.text, block_id=block.block_id, location=block.location, skip_neural=skip_neural)
+        if skip_neural or not doc.blocks:
+            for block in doc.blocks:
+                block_entities = cls.detect_in_text(block.text, block_id=block.block_id, location=block.location, skip_neural=True)
+                all_entities.extend(block_entities)
+            return all_entities
+
+        # Identify candidate blocks that pass fast pre-screening
+        candidate_blocks = []
+        candidate_indices = []
+        for idx, block in enumerate(doc.blocks):
+            if not cls.should_skip_neural(block.text):
+                candidate_blocks.append(block)
+                candidate_indices.append(idx)
+
+        # Execute batched neural inference across all candidate blocks at once
+        neural_matches_by_idx: Dict[int, List[Dict[str, Any]]] = {}
+        if candidate_blocks:
+            batch_texts = [b.text for b in candidate_blocks]
+            batch_results = OpenAIPrivacyFilterEngine.detect_in_batch(batch_texts)
+            for orig_idx, matches in zip(candidate_indices, batch_results):
+                neural_matches_by_idx[orig_idx] = matches
+
+        # Resolve each block with source traceability
+        for idx, block in enumerate(doc.blocks):
+            extra_candidates = neural_matches_by_idx.get(idx, [])
+            block_entities = cls.detect_in_text(
+                block.text,
+                block_id=block.block_id,
+                location=block.location,
+                skip_neural=True,
+                extra_candidates=extra_candidates
+            )
             all_entities.extend(block_entities)
 
         return all_entities
 
     @classmethod
-    def detect_in_text(cls, text: str, block_id: Optional[str] = None, location: Optional[Dict[str, Any]] = None, skip_neural: bool = False) -> List[PIIEntity]:
+    def detect_in_text(
+        cls,
+        text: str,
+        block_id: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
+        skip_neural: bool = False,
+        extra_candidates: Optional[List[Dict[str, Any]]] = None
+    ) -> List[PIIEntity]:
         if not text or not text.strip():
             return []
 
@@ -84,8 +152,10 @@ class PIIEngine:
         pattern_matches = PatternLibrary.find_all_matches(text)
         candidates.extend(pattern_matches)
 
-        # 2. Tier 2: OpenAI Privacy Filter (Local Neural Token-Classification)
-        if not skip_neural:
+        # 2. Tier 2: OpenAI Privacy Filter (Local Neural Token-Classification with fast pre-screening)
+        if extra_candidates is not None:
+            candidates.extend(extra_candidates)
+        elif not skip_neural and not cls.should_skip_neural(text):
             openai_matches = OpenAIPrivacyFilterEngine.detect_in_text(text)
             candidates.extend(openai_matches)
 
@@ -93,18 +163,19 @@ class PIIEngine:
         for pat in cls.NAME_LABEL_PATTERNS:
             for m in pat.finditer(text):
                 s, e = m.start(1), m.end(1)
-                while s < e and text[s].isspace():
-                    s += 1
-                while e > s and text[e - 1].isspace():
-                    e -= 1
-                if s >= e:
+                name_val = text[s:e].strip()
+                words = name_val.split()
+                while words and words[-1].lower() in {"date", "dob", "status", "age", "address", "email", "phone", "ssn", "tax", "role", "title", "id", "no", "account"}:
+                    words.pop()
+                if not words:
                     continue
-                name_val = text[s:e]
+                clean_name = " ".join(words)
+                new_e = s + len(clean_name)
                 candidates.append({
                     "entity_type": "PERSON",
-                    "value": name_val,
+                    "value": clean_name,
                     "start": s,
-                    "end": e,
+                    "end": new_e,
                     "confidence": 0.98,
                     "source": "Cadence_Contextual_Rule"
                 })
@@ -120,17 +191,30 @@ class PIIEngine:
                 )
                 for res in presidio_results:
                     val = text[res.start:res.end].strip()
+                    val_lower = val.lower()
                     if len(val) <= 2:
                         continue
 
                     e_type = res.entity_type
                     # Filter out financial and non-PII terms from Presidio
-                    if cls._is_safe_whitelist_match(text, res.start, res.end, val):
+                    if cls._is_safe_whitelist_match(text, res.start, res.end, val) or val_lower in cls.KNOWN_HEADER_LABELS:
                         continue
 
-                    # If tagged as location but contains common financial tokens, drop
-                    if e_type == "LOCATION" and any(w in val.lower() for w in ["checking", "escrow", "savings", "balance", "total", "credit"]):
-                        continue
+                    # Filter out phone false positives (e.g. 9-digit ABA routing numbers or low conf)
+                    if e_type == "PHONE_NUMBER":
+                        digits = "".join(ch for ch in val if ch.isdigit())
+                        if res.score < 0.70 or len(digits) != 10:
+                            continue
+
+                    # Filter out generic locations and non-geographical nouns
+                    if e_type == "LOCATION":
+                        if any(w in val_lower for w in ["checking", "escrow", "savings", "balance", "total", "credit", "lake", "river", "floor", "contact", "date", "status", "level", "room", "table"]):
+                            continue
+
+                    # Filter out person false positives
+                    if e_type == "PERSON":
+                        if any(w in val_lower for w in ["driver", "floor", "contact", "date", "status", "may", "march", "table", "q3 high net", "beneficiary name", "beneficiary address"]):
+                            continue
 
                     candidates.append({
                         "entity_type": e_type,
@@ -171,6 +255,14 @@ class PIIEngine:
             val_clean = c["value"].strip()
             val_lower = val_clean.lower()
 
+            # Discard surrogate tokens or previously redacted tokens
+            if re.match(r"^\[?[A-Z_]+_\d+\]?$", val_clean) or val_clean in {"[REDACTED]", "REDACTED", "[MASKED]", "MASKED"}:
+                continue
+
+            # Discard header labels
+            if val_lower in cls.KNOWN_HEADER_LABELS:
+                continue
+
             # Discard whitelist items
             if cls._is_safe_whitelist_match(text, c["start"], c["end"], val_clean):
                 continue
@@ -179,11 +271,21 @@ class PIIEngine:
             if val_clean.startswith("$") and any(ch.isdigit() for ch in val_clean):
                 continue
 
-            # Discard table headers or labels falsely tagged
-            if val_lower in {"client name", "tax id / ssn", "account number", "contact email", "phone", "institution", "primary borrower", "underwriter"}:
-                continue
-
             filtered_candidates.append(c)
+
+        # Step 1: Merge adjacent candidates of identical entity type separated only by whitespace or hyphen
+        pre_sorted = sorted(filtered_candidates, key=lambda x: (x["start"], x["end"]))
+        merged_adjacent: List[Dict[str, Any]] = []
+        for cand in pre_sorted:
+            if merged_adjacent and merged_adjacent[-1]["entity_type"] == cand["entity_type"]:
+                prev = merged_adjacent[-1]
+                gap = text[prev["end"]:cand["start"]]
+                if gap.strip() in ("", "-"):
+                    prev["end"] = cand["end"]
+                    prev["value"] = text[prev["start"]:cand["end"]]
+                    prev["confidence"] = max(prev["confidence"], cand["confidence"])
+                    continue
+            merged_adjacent.append(cand)
 
         # Priority weights: deterministic checksums > OpenAI Privacy Filter > contact/IDs > NER
         priority_map = {
@@ -211,24 +313,25 @@ class PIIEngine:
             "LOCATION": 3
         }
 
-        # Source priority bonus: Regex Checksum (+2) > OpenAI Privacy Filter (+1.5) > Contextual Rule (+1) > Presidio (+0)
+        # Source priority bonus: Regex Checksum (+2) > Contextual Rule (+1.8) > OpenAI (+1.5) > Presidio (+0)
         source_bonus = {
             "Regex_Checksum_Engine": 2.0,
             "Cadence_Financial_Engine": 2.0,
             "Cadence_Corporate_Engine": 2.0,
+            "Cadence_Contextual_Rule": 1.8,
+            "Cadence_Rule": 1.8,
             "OpenAI_Privacy_Filter": 1.5,
-            "Cadence_Contextual_Rule": 1.2,
-            "Cadence_Rule": 1.2,
             "Cadence_Contextual_Engine": 1.0,
             "Presidio_NER": 0.0
         }
 
-        # Sort by effective priority desc, then length desc, then confidence desc, then start asc
+        # Sort by entity priority desc, then longer span desc, then source bonus desc, then start asc
         sorted_candidates = sorted(
-            filtered_candidates,
+            merged_adjacent,
             key=lambda c: (
-                -(priority_map.get(c["entity_type"], 1) + source_bonus.get(c.get("source", ""), 0)),
+                -(priority_map.get(c["entity_type"], 1)),
                 -(c["end"] - c["start"]),
+                -(source_bonus.get(c.get("source", ""), 0)),
                 -c["confidence"],
                 c["start"]
             )

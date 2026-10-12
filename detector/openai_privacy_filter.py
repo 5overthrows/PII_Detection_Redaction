@@ -109,6 +109,23 @@ FALSE_POSITIVE_WHITELIST = {
     "recommendation",
     "continuous",
     "reference pack",
+    "beneficiary name",
+    "beneficiary address",
+    "client name",
+    "primary borrower",
+    "q3 high net",
+    "high net worth",
+    "wealth management",
+    "portfolio review",
+    "operational risk",
+    "credit risk",
+    "market risk",
+    "risk management",
+    "driver license",
+    "driver",
+    "floor",
+    "suite",
+    "lake",
 }
 
 
@@ -212,28 +229,38 @@ class OpenAIPrivacyFilterEngine:
                 local_files_only=True,
             )
 
-            model = AutoModelForTokenClassification.from_pretrained(
-                cls.MODEL_ID,
-                local_files_only=True,
-                low_cpu_mem_usage=True,
-            )
-
-            # Avoid assuming CUDA exists.
-            device = 0 if torch.cuda.is_available() else -1
+            is_cuda = torch.cuda.is_available()
+            if is_cuda:
+                device = 0
+                torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                model = AutoModelForTokenClassification.from_pretrained(
+                    cls.MODEL_ID,
+                    local_files_only=True,
+                    torch_dtype=torch_dtype,
+                ).to("cuda")
+                pipeline_device = None
+            else:
+                device = -1
+                model = AutoModelForTokenClassification.from_pretrained(
+                    cls.MODEL_ID,
+                    local_files_only=True,
+                    low_cpu_mem_usage=True,
+                )
+                pipeline_device = -1
 
             cls._pipeline = pipeline(
                 task="token-classification",
                 model=model,
                 tokenizer=tokenizer,
                 aggregation_strategy="simple",
-                device=device,
+                device=pipeline_device,
             )
 
             cls._tokenizer = tokenizer
 
             logger.info(
                 "Privacy Filter loaded on %s",
-                "CUDA" if device == 0 else "CPU",
+                "CUDA" if is_cuda else "CPU",
             )
 
             return cls._pipeline
@@ -401,99 +428,87 @@ class OpenAIPrivacyFilterEngine:
     # -----------------------------------------------------
 
     @classmethod
-    def detect_in_text(
+    def detect_in_batch(
         cls,
-        text: str,
+        texts: list[str],
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
-    ) -> list[dict[str, Any]]:
+    ) -> list[list[dict[str, Any]]]:
         """
-        Detect PII in one complete text.
-
-        Raises PrivacyFilterError if model inference fails.
-        Does not silently report a failed scan as clean.
+        Batched PII detection across multiple texts simultaneously.
+        Aggregates chunks across all texts and runs a single batched inference pass on GPU/CPU.
         """
-        if not text or len(text.strip()) < 4:
+        if not texts:
             return []
 
+        import torch
         classifier = cls.get_pipeline()
 
-        chunks = cls.make_chunks(text)
-        if not chunks:
-            return cls.detect_structured_pii(text)
+        # Prepare chunks and map back to source text index
+        all_chunks: list[dict[str, Any]] = []
+        chunk_to_text_idx: list[int] = []
+        text_structured: list[list[dict[str, Any]]] = []
 
-        candidates = cls.detect_structured_pii(text)
+        for idx, text in enumerate(texts):
+            struct = cls.detect_structured_pii(text) if (text and len(text.strip()) >= 4) else []
+            text_structured.append(struct)
+            if not text or len(text.strip()) < 4:
+                continue
+            chunks = cls.make_chunks(text)
+            for ch in chunks:
+                all_chunks.append(ch)
+                chunk_to_text_idx.append(idx)
 
-        # Batched inference avoids one model call per paragraph.
-        chunk_texts = [chunk["text"] for chunk in chunks]
+        if not all_chunks:
+            return text_structured
+
+        chunk_texts = [ch["text"] for ch in all_chunks]
+        batch_sz = max(BATCH_SIZE, 16 if torch.cuda.is_available() else BATCH_SIZE)
 
         try:
-            predictions = classifier(
-                chunk_texts,
-                batch_size=BATCH_SIZE,
-            )
+            with torch.inference_mode():
+                predictions = classifier(
+                    chunk_texts,
+                    batch_size=batch_sz,
+                )
         except Exception as exc:
-            logger.exception("Model inference failed")
-            raise PrivacyFilterError(
-                f"Model inference failed: {exc}"
-            ) from exc
+            logger.exception("Model batch inference failed")
+            raise PrivacyFilterError(f"Model batch inference failed: {exc}") from exc
 
-        if len(predictions) != len(chunks):
-            raise PrivacyFilterError(
-                "Model output count did not match input chunks"
-            )
+        if len(predictions) != len(all_chunks):
+            raise PrivacyFilterError("Model output count did not match input chunks")
 
-        for chunk, results in zip(chunks, predictions):
+        # Group predictions back to their respective texts
+        results_by_text: list[list[dict[str, Any]]] = [list(struct) for struct in text_structured]
+
+        for chunk, text_idx, pred_results in zip(all_chunks, chunk_to_text_idx, predictions):
+            text = texts[text_idx]
             chunk_text = chunk["text"]
             base_offset = chunk["start"]
 
-            for item in results:
-                label = str(
-                    item.get("entity_group", "")
-                ).lower()
-
+            for item in pred_results:
+                label = str(item.get("entity_group", "")).lower()
                 score = float(item.get("score", 0.0))
-
                 if score < confidence_threshold:
                     continue
-
                 start = item.get("start")
                 end = item.get("end")
-
-                if start is None or end is None:
-                    continue
-
-                if not (0 <= start < end <= len(chunk_text)):
+                if start is None or end is None or not (0 <= start < end <= len(chunk_text)):
                     continue
 
                 entity_type = OPENAI_TO_OPTIV_TAXONOMY.get(label)
-
                 if not entity_type:
                     continue
 
                 value = chunk_text[start:end]
-
-                # Contextual date handling.
                 if label == "private_date":
                     if re.fullmatch(r"20\d{2}", value.strip()):
                         continue
-
-                    prefix = chunk_text[
-                        max(0, start - 35):start
-                    ].lower()
-
-                    if any(
-                        key in prefix
-                        for key in ("dob", "birth", "born")
-                    ):
+                    prefix = chunk_text[max(0, start - 35):start].lower()
+                    if any(key in prefix for key in ("dob", "birth", "born")):
                         entity_type = "DATE_OF_BIRTH"
-                    elif any(
-                        key in prefix
-                        for key in ("date:", "dated", "effective")
-                    ):
+                    elif any(key in prefix for key in ("date:", "dated", "effective")):
                         continue
 
-                # Convert chunk-relative offsets into offsets
-                # relative to the original extracted text.
                 entity = cls._make_entity(
                     text=text,
                     start=base_offset + start,
@@ -503,11 +518,26 @@ class OpenAIPrivacyFilterEngine:
                     source="OpenAI_Privacy_Filter",
                     raw_label=label,
                 )
-
                 if entity:
-                    candidates.append(entity)
+                    results_by_text[text_idx].append(entity)
 
-        return cls.merge_entities(candidates, len(text))
+        final_results = []
+        for idx, text in enumerate(texts):
+            candidates = results_by_text[idx]
+            final_results.append(cls.merge_entities(candidates, len(text), text=text))
+        return final_results
+
+    @classmethod
+    def detect_in_text(
+        cls,
+        text: str,
+        confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    ) -> list[dict[str, Any]]:
+        """
+        Detect PII in one complete text using the unified batch engine.
+        """
+        results = cls.detect_in_batch([text], confidence_threshold=confidence_threshold)
+        return results[0] if results else []
 
     # -----------------------------------------------------
     # Duplicate and overlap resolution
@@ -517,10 +547,12 @@ class OpenAIPrivacyFilterEngine:
     def merge_entities(
         candidates: list[dict[str, Any]],
         text_length: int,
+        text: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
         Remove duplicate detections caused by overlapping chunks.
         Prefer higher-confidence entities when spans overlap.
+        Merges adjacent entities of identical type when separated only by whitespace.
         """
         valid = [
             dict(entity)
@@ -569,7 +601,24 @@ class OpenAIPrivacyFilterEngine:
             if not overlaps:
                 selected.append(entity)
 
-        return sorted(selected, key=lambda entity: entity["start"])
+        selected.sort(key=lambda entity: entity["start"])
+
+        # Merge adjacent entities of the same type separated only by whitespace/hyphen
+        if text:
+            merged = []
+            for ent in selected:
+                if merged and merged[-1]["entity_type"] == ent["entity_type"]:
+                    prev = merged[-1]
+                    gap = text[prev["end"]:ent["start"]]
+                    if gap.strip() in ("", "-"):
+                        prev["end"] = ent["end"]
+                        prev["value"] = text[prev["start"]:ent["end"]]
+                        prev["confidence"] = max(prev["confidence"], ent["confidence"])
+                        continue
+                merged.append(ent)
+            return merged
+
+        return selected
 
     # -----------------------------------------------------
     # Selective redaction

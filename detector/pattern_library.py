@@ -60,7 +60,7 @@ class PatternLibrary:
         re.compile(r'\bACCT-([0-9]{8,16})\b', re.IGNORECASE),
     ]
     BANK_ROUTING_PATTERN = re.compile(r'\b(?:Routing(?:\s*Number)?|ABA|RTN)[:\s#-]*([0-9]{9})\b', re.IGNORECASE)
-    SWIFT_BIC_PATTERN = re.compile(r'\b(?:SWIFT|BIC)[:\s#-]*([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b|\b[A-Z]{6}[A-Z0-9]{2}[A-Z0-9]{3}\b')
+    SWIFT_BIC_PATTERN = re.compile(r'\b(?:SWIFT|BIC)[:\s#-]*([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b|\b([A-Z]{4}(?:US|GB|IN|DE|FR|CH|JP|SG|HK|CA|AU|NL|IT|ES|AE|SE)[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b')
     IFSC_PATTERN = re.compile(r'\b[A-Z]{4}0[A-Z0-9]{6}\b')
     IBAN_PATTERN = re.compile(r'\b[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}\b')
 
@@ -75,7 +75,7 @@ class PatternLibrary:
     DOB_PATTERNS = [
         re.compile(r'\b(?:DOB|Date of Birth|Birth Date)[:\s]+([0-9]{1,2}[\/\-][0-9]{1,2}[\/\-][0-9]{2,4}|[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4})\b', re.IGNORECASE),
     ]
-    ADDRESS_LINE_PATTERN = re.compile(r'\b\d{1,5}\s+[A-Za-z0-9\s,.-]+?\b(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Terrace|Way|Drive|Dr|Nagar|Lane|Ln|Apt|Suite)\b', re.IGNORECASE)
+    ADDRESS_LINE_PATTERN = re.compile(r'\b\d{1,5}\s+[A-Z][A-Za-z0-9\s,.-]{1,35}?\b(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Boulevard|Blvd\.?|Terrace|Drive|Dr\.?|Lane|Ln\.?|Way|Court|Ct\.?|Nagar)(?:\s*(?:Apt|Suite|Unit|Fl|Floor)\s+[A-Za-z0-9-]+)?\b')
     ADDRESS_BLOCK_PATTERN = re.compile(r'\b(?:Address|Residential\s*Address)[:\s]*\n([0-9]{1,5}\s+[^\n]+(?:\n[^\n]+){1,3})', re.IGNORECASE)
 
     # 4. Corporate & Educational Identifiers
@@ -181,13 +181,24 @@ class PatternLibrary:
             })
 
         # 7. SWIFT / BIC
+        ENGLISH_UPPER_WORDS = {
+            "OPERATIONAL", "INFORMATION", "APPLICATION", "TRANSACTION", "METHODOLOGY",
+            "CREDIBILITY", "LIABILITIES", "REGULATIONS", "LEGISLATION", "CERTIFICATE",
+            "PERFORMANCE", "SUPERVISORY", "INTEGRATION", "COORDINATOR", "ACCOUNTABLE",
+            "UNDERWRITING", "CONFIDENTIAL", "RECOMMENDATION", "INSTITUTION", "GOVERNANCE"
+        }
         for m in cls.SWIFT_BIC_PATTERN.finditer(text):
             if m.group(1):
                 val = m.group(1)
                 s, e = m.start(1), m.end(1)
+            elif m.group(2):
+                val = m.group(2)
+                s, e = m.start(2), m.end(2)
             else:
                 val = m.group(0)
                 s, e = m.start(), m.end()
+            if val.upper() in ENGLISH_UPPER_WORDS:
+                continue
             matches.append({
                 "entity_type": "SWIFT_BIC",
                 "value": val,
